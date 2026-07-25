@@ -15,6 +15,33 @@ from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
 from lxml import etree
 
+def verificar_password():
+    """Muestra un formulario de contraseña y detiene la app si es incorrecta."""
+    def password_entered():
+        if st.session_state["password"] == st.secrets["password"]:
+            st.session_state["password_correct"] = True
+            del st.session_state["password"]
+        else:
+            st.session_state["password_correct"] = False
+
+    if "password_correct" not in st.session_state:
+        st.text_input(
+            "🔒 Contraseña de acceso", type="password",
+            on_change=password_entered, key="password"
+        )
+        st.stop()
+    elif not st.session_state["password_correct"]:
+        st.text_input(
+            "🔒 Contraseña de acceso", type="password",
+            on_change=password_entered, key="password"
+        )
+        st.error("❌ Contraseña incorrecta")
+        st.stop()
+
+verificar_password()
+
+
+
 _LOGO_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" width="90" height="90">
   <rect width="100" height="100" rx="14" fill="#1a1f2e" stroke="rgba(57,211,83,0.4)" stroke-width="2"/>
   <circle cx="50" cy="38" r="22" fill="none" stroke="#39d353" stroke-width="3.5"/>
