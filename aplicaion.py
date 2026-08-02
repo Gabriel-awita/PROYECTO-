@@ -686,11 +686,44 @@ def _extraer_xml_combinado(doc_origen) -> bytes:
     return doc_origen.element.body
 
 
+def _es_parrafo_transicional(elem, ns: str) -> bool:
+    """
+    Detecta un párrafo 'fantasma' que no aporta contenido visible pero que,
+    al aislar un informe individual del combinado, produce una página en
+    blanco de más (al inicio o al final del archivo). Dos casos típicos:
+      1. Un salto de página manual (Ctrl+Enter en Word) sin texto.
+      2. Una marca de fin de sección de Word (w:sectPr dentro de w:pPr)
+         sin texto — usada en el combinado para separar secciones, pero
+         sin sentido ya en un documento aislado de una sola persona.
+    Solo se considera 'transicional' si el párrafo NO tiene texto visible;
+    nunca se elimina contenido real.
+    """
+    if elem.tag.split('}')[-1] != 'p':
+        return False
+    if texto_parrafo(elem).strip():
+        return False  # tiene texto real, no se toca
+
+    saltos = elem.findall(f'.//{{{ns}}}br')
+    if any(br.get(f'{{{ns}}}type') == 'page' for br in saltos):
+        return True
+
+    ppr = elem.find(f'{{{ns}}}pPr')
+    if ppr is not None and ppr.find(f'{{{ns}}}sectPr') is not None:
+        return True
+
+    return False
+
+
 def clonar_bloque_como_zip(original_zip_bytes: bytes, inicio: int, fin: int) -> bytes:
     """
     Clona el ZIP completo del docx original pero reemplazando el body
     del document.xml para contener solo los elementos [inicio:fin].
     Esto preserva 100% imágenes, estilos, headers, temas y fuentes.
+
+    Además, recorta del inicio y del final del rango cualquier párrafo
+    'transicional' (salto de página o marca de sección sin texto) que
+    en el combinado servía para separar un informe del siguiente, pero
+    que al aislar el informe produce una página en blanco de más.
     """
     NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
 
@@ -711,8 +744,15 @@ def clonar_bloque_como_zip(original_zip_bytes: bytes, inicio: int, fin: int) -> 
     for elem in list(body):
         body.remove(elem)
 
-    # Insertar solo el rango del informe
-    for elem in children[inicio:fin]:
+    # Rango del informe, recortando párrafos transicionales en los bordes
+    rango = children[inicio:fin]
+    while rango and _es_parrafo_transicional(rango[0], NS):
+        rango = rango[1:]
+    while rango and _es_parrafo_transicional(rango[-1], NS):
+        rango = rango[:-1]
+
+    # Insertar solo el rango del informe (ya recortado)
+    for elem in rango:
         body.append(elem)
 
     # Restaurar sectPr
