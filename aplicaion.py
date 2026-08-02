@@ -761,17 +761,28 @@ def _buscar_libreoffice() -> str | None:
         return shutil.which("libreoffice") or shutil.which("soffice")
 
 
+# Perfil de LibreOffice persistente y reutilizable. Se crea UNA sola vez
+# (no por cada conversión) para evitar el costo de "arranque en frío" que
+# tiene LibreOffice al inicializar un perfil nuevo (caché de fuentes,
+# configuración, registro de extensiones), lo cual puede tomar varios
+# segundos por archivo. Reutilizar el mismo perfil es seguro frente a
+# concurrencia porque _GLOBAL_HEAVY_LOCK ya garantiza que solo una
+# conversión ocurre a la vez en todo el proceso, sin importar cuántos
+# usuarios estén conectados.
+_LO_PROFILE_DIR = os.path.join(tempfile.gettempdir(), "frijolito_lo_profile")
+os.makedirs(_LO_PROFILE_DIR, exist_ok=True)
+
+
 def docx_a_pdf_libreoffice(docx_bytes: bytes, nombre_base: str) -> bytes | None:
     """
     Convierte bytes de un .docx a bytes de .pdf usando LibreOffice headless.
     Detecta automáticamente la ruta en Windows y Linux/Mac.
 
-    IMPORTANTE — aislamiento de perfil: cada llamada usa un perfil de
-    usuario de LibreOffice temporal y exclusivo (-env:UserInstallation).
-    Sin esto, si dos usuarios convierten documentos al mismo tiempo (por
-    ejemplo, en Streamlit Cloud con varias sesiones activas), LibreOffice
-    intenta compartir el mismo perfil por defecto y sus procesos headless
-    pueden bloquearse entre sí por el lock de perfil, fallando o colgándose.
+    Usa un perfil de usuario de LibreOffice persistente (_LO_PROFILE_DIR)
+    en vez de uno nuevo por llamada: esto evita el "arranque en frío" lento
+    de LibreOffice sin sacrificar seguridad frente a concurrencia, ya que
+    todas las conversiones pasan por _GLOBAL_HEAVY_LOCK y nunca ocurren en
+    paralelo.
 
     Retorna bytes del PDF o None si falla.
     """
@@ -782,16 +793,13 @@ def docx_a_pdf_libreoffice(docx_bytes: bytes, nombre_base: str) -> bytes | None:
     with tempfile.TemporaryDirectory() as tmpdir:
         ruta_docx = os.path.join(tmpdir, f"{nombre_base}.docx")
         ruta_pdf  = os.path.join(tmpdir, f"{nombre_base}.pdf")
-        # Perfil de usuario exclusivo para esta conversión: evita el lock
-        # de perfil de LibreOffice cuando hay conversiones concurrentes.
-        perfil_dir = os.path.join(tmpdir, "lo_profile")
 
         with open(ruta_docx, 'wb') as f:
             f.write(docx_bytes)
 
         result = subprocess.run(
             [ejecutable, '--headless',
-             f'-env:UserInstallation=file://{perfil_dir}',
+             f'-env:UserInstallation=file://{_LO_PROFILE_DIR}',
              '--convert-to', 'pdf',
              '--outdir', tmpdir, ruta_docx],
             capture_output=True, text=True, timeout=120
