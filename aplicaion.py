@@ -8,12 +8,51 @@ import subprocess
 import tempfile
 import os
 import zipfile
+import threading
 import pypdf
 from io import BytesIO
 from docx import Document
 from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
 from lxml import etree
+
+# ══════════════════════════════════════════════════════════════════
+#  CONCURRENCIA — mejoras para uso simultáneo de varios usuarios
+# ══════════════════════════════════════════════════════════════════
+
+# Lock global del proceso: Streamlit Cloud (plan gratuito) corre todas las
+# sesiones de todos los usuarios dentro del MISMO proceso/contenedor
+# (~1GB de RAM compartida). Las operaciones pesadas (conversión a PDF con
+# LibreOffice, procesamiento masivo de PDFs) se serializan con este lock
+# para que, si dos personas las disparan al mismo tiempo, se hagan en fila
+# en vez de competir por CPU/RAM simultáneamente. El costo es que la
+# segunda persona espera un poco más; el beneficio es que ninguna de las
+# dos se queda a medias ni ralentiza a un tercer usuario que solo está
+# navegando la app.
+_GLOBAL_HEAVY_LOCK = threading.Lock()
+
+
+def mostrar_advertencia_tamano(archivos, limite_mb=150):
+    """
+    Avisa si el total de archivos subidos en esta operación es grande.
+    No bloquea nada: es solo información para que el usuario sepa que,
+    si varias personas usan la app a la vez con lotes grandes, el
+    rendimiento compartido (plan gratuito ≈1GB RAM) puede verse afectado.
+    """
+    if not archivos:
+        return
+    try:
+        total_mb = sum(getattr(a, "size", 0) or 0 for a in archivos) / (1024 * 1024)
+    except Exception:
+        return
+    if total_mb > limite_mb:
+        st.warning(
+            f"⚠️ Este lote pesa ~{total_mb:.0f} MB. Si otras personas están usando "
+            f"Frijolito al mismo tiempo, procesar lotes grandes puede hacer que la "
+            f"app vaya más lenta para todos (el plan gratuito comparte recursos). "
+            f"Si notas lentitud, considera dividir el lote en partes más pequeñas."
+        )
+
 
 def verificar_password():
     """Muestra un formulario de contraseña y detiene la app si es incorrecta."""
@@ -726,6 +765,14 @@ def docx_a_pdf_libreoffice(docx_bytes: bytes, nombre_base: str) -> bytes | None:
     """
     Convierte bytes de un .docx a bytes de .pdf usando LibreOffice headless.
     Detecta automáticamente la ruta en Windows y Linux/Mac.
+
+    IMPORTANTE — aislamiento de perfil: cada llamada usa un perfil de
+    usuario de LibreOffice temporal y exclusivo (-env:UserInstallation).
+    Sin esto, si dos usuarios convierten documentos al mismo tiempo (por
+    ejemplo, en Streamlit Cloud con varias sesiones activas), LibreOffice
+    intenta compartir el mismo perfil por defecto y sus procesos headless
+    pueden bloquearse entre sí por el lock de perfil, fallando o colgándose.
+
     Retorna bytes del PDF o None si falla.
     """
     ejecutable = _buscar_libreoffice()
@@ -735,12 +782,17 @@ def docx_a_pdf_libreoffice(docx_bytes: bytes, nombre_base: str) -> bytes | None:
     with tempfile.TemporaryDirectory() as tmpdir:
         ruta_docx = os.path.join(tmpdir, f"{nombre_base}.docx")
         ruta_pdf  = os.path.join(tmpdir, f"{nombre_base}.pdf")
+        # Perfil de usuario exclusivo para esta conversión: evita el lock
+        # de perfil de LibreOffice cuando hay conversiones concurrentes.
+        perfil_dir = os.path.join(tmpdir, "lo_profile")
 
         with open(ruta_docx, 'wb') as f:
             f.write(docx_bytes)
 
         result = subprocess.run(
-            [ejecutable, '--headless', '--convert-to', 'pdf',
+            [ejecutable, '--headless',
+             f'-env:UserInstallation=file://{perfil_dir}',
+             '--convert-to', 'pdf',
              '--outdir', tmpdir, ruta_docx],
             capture_output=True, text=True, timeout=120
         )
@@ -954,7 +1006,7 @@ def generar_zip_fusionados(grupos: dict, progreso_widget) -> bytes:
 
 
 # ══════════════════════════════════════════════════════════════════
-#  INTERFAZ — TABS
+# INTERFAZ — TABS
 # ══════════════════════════════════════════════════════════════════
 
 st.markdown('<div class="divider"></div>', unsafe_allow_html=True)
@@ -980,6 +1032,7 @@ with tab1:
         if archivos_pdf:
             st.markdown(f'<div class="chip-row"><span class="chip chip-green">✔ {len(archivos_pdf)} archivo(s)</span></div>',
                         unsafe_allow_html=True)
+            mostrar_advertencia_tamano(archivos_pdf)
         st.markdown('</div>', unsafe_allow_html=True)
 
     with col2:
@@ -1070,59 +1123,65 @@ with tab1:
             errores = 0
             no_encontrados = []
 
-            doc = Document(archivo_word)
-            mapa_word = construir_mapa_word(doc)
-            progreso = st.progress(0, text="Iniciando…")
-            total = len(archivos_pdf)
+            # Bloqueo global: el procesamiento masivo de PDFs consume CPU
+            # de forma intensiva. Si varios usuarios pulsan "Procesar" al
+            # mismo tiempo en Streamlit Cloud (contenedor compartido), esto
+            # evita que compitan por CPU/RAM de forma simultánea y
+            # simplemente se turnan, evitando lentitud generalizada.
+            with _GLOBAL_HEAVY_LOCK:
+                doc = Document(archivo_word)
+                mapa_word = construir_mapa_word(doc)
+                progreso = st.progress(0, text="Iniciando…")
+                total = len(archivos_pdf)
 
-            for idx, pdf in enumerate(archivos_pdf):
-                nombre_archivo = pdf.name
-                try:
-                    nombre_pdf = extraer_nombre_pdf(pdf)
-                    if not nombre_pdf:
-                        reporte.append({"PDF": nombre_archivo, "Estado": "❌ ERROR",
-                                        "Detalle": "No se detectó nombre en el PDF"})
+                for idx, pdf in enumerate(archivos_pdf):
+                    nombre_archivo = pdf.name
+                    try:
+                        nombre_pdf = extraer_nombre_pdf(pdf)
+                        if not nombre_pdf:
+                            reporte.append({"PDF": nombre_archivo, "Estado": "❌ ERROR",
+                                            "Detalle": "No se detectó nombre en el PDF"})
+                            errores += 1
+                            progreso.progress((idx+1)/total, text=f"{idx+1}/{total} — {nombre_archivo}")
+                            continue
+
+                        tabla_pdf = extraer_tabla_obligaciones_pdf(pdf)
+                        if not tabla_pdf:
+                            reporte.append({"PDF": nombre_archivo, "Estado": "❌ ERROR",
+                                            "Detalle": f"No se encontró tabla de obligaciones | {nombre_pdf}"})
+                            errores += 1
+                            progreso.progress((idx+1)/total, text=f"{idx+1}/{total} — {nombre_archivo}")
+                            continue
+
+                        nombre_word, score = buscar_mejor_match(nombre_pdf, mapa_word)
+                        if not nombre_word:
+                            reporte.append({"PDF": nombre_archivo, "Estado": "❌ ERROR",
+                                            "Detalle": f"Sin coincidencia en Word para '{nombre_pdf}' (mejor score: {score}/100)"})
+                            no_encontrados.append(nombre_pdf)
+                            errores += 1
+                            progreso.progress((idx+1)/total, text=f"{idx+1}/{total} — {nombre_archivo}")
+                            continue
+
+                        n_tablas = reemplazar_tablas_obligaciones(doc, mapa_word[nombre_word], tabla_pdf)
+                        n_obl = len(tabla_pdf) - 1
+                        nota = "" if score == 100 else f" [fuzzy {score}/100 → '{nombre_word}']"
+                        procesados += 1
+                        reporte.append({
+                            "PDF": nombre_archivo,
+                            "Estado": "✅ OK",
+                            "Detalle": f"{nombre_pdf} | {n_obl} obligaciones copiadas | {n_tablas} tabla(s){nota}"
+                        })
+
+                    except Exception as e:
                         errores += 1
-                        progreso.progress((idx+1)/total, text=f"{idx+1}/{total} — {nombre_archivo}")
-                        continue
-
-                    tabla_pdf = extraer_tabla_obligaciones_pdf(pdf)
-                    if not tabla_pdf:
                         reporte.append({"PDF": nombre_archivo, "Estado": "❌ ERROR",
-                                        "Detalle": f"No se encontró tabla de obligaciones | {nombre_pdf}"})
-                        errores += 1
-                        progreso.progress((idx+1)/total, text=f"{idx+1}/{total} — {nombre_archivo}")
-                        continue
+                                        "Detalle": str(e)})
 
-                    nombre_word, score = buscar_mejor_match(nombre_pdf, mapa_word)
-                    if not nombre_word:
-                        reporte.append({"PDF": nombre_archivo, "Estado": "❌ ERROR",
-                                        "Detalle": f"Sin coincidencia en Word para '{nombre_pdf}' (mejor score: {score}/100)"})
-                        no_encontrados.append(nombre_pdf)
-                        errores += 1
-                        progreso.progress((idx+1)/total, text=f"{idx+1}/{total} — {nombre_archivo}")
-                        continue
+                    progreso.progress((idx+1)/total, text=f"Procesando {idx+1}/{total}…")
 
-                    n_tablas = reemplazar_tablas_obligaciones(doc, mapa_word[nombre_word], tabla_pdf)
-                    n_obl = len(tabla_pdf) - 1
-                    nota = "" if score == 100 else f" [fuzzy {score}/100 → '{nombre_word}']"
-                    procesados += 1
-                    reporte.append({
-                        "PDF": nombre_archivo,
-                        "Estado": "✅ OK",
-                        "Detalle": f"{nombre_pdf} | {n_obl} obligaciones copiadas | {n_tablas} tabla(s){nota}"
-                    })
-
-                except Exception as e:
-                    errores += 1
-                    reporte.append({"PDF": nombre_archivo, "Estado": "❌ ERROR",
-                                    "Detalle": str(e)})
-
-                progreso.progress((idx+1)/total, text=f"Procesando {idx+1}/{total}…")
-
-            output = BytesIO()
-            doc.save(output)
-            output.seek(0)
+                output = BytesIO()
+                doc.save(output)
+                output.seek(0)
 
             st.markdown('<div class="divider"></div>', unsafe_allow_html=True)
             cr1, cr2 = st.columns(2)
@@ -1180,12 +1239,21 @@ with tab2:
     if archivo_combinado:
         st.markdown('<div class="chip-row"><span class="chip chip-blue">✔ Combinado cargado</span></div>',
                     unsafe_allow_html=True)
+        mostrar_advertencia_tamano([archivo_combinado])
     st.markdown('</div>', unsafe_allow_html=True)
 
     st.markdown('<div class="divider"></div>', unsafe_allow_html=True)
 
     if archivo_combinado:
-        btn_detectar = st.button("🔍 Detectar informes", key="btn_detectar")
+        col_det, col_limpiar = st.columns([3, 1])
+        with col_det:
+            btn_detectar = st.button("🔍 Detectar informes", key="btn_detectar")
+        with col_limpiar:
+            if st.button("🧹 Liberar memoria", key="btn_limpiar_tab2",
+                         help="Borra de esta sesión los datos ya descargados para liberar RAM"):
+                for k in ('bloques_detectados', 'doc_split_bytes'):
+                    st.session_state.pop(k, None)
+                st.success("Memoria de esta sesión liberada.")
 
         if btn_detectar or st.session_state.get('bloques_detectados'):
 
@@ -1294,9 +1362,13 @@ with tab2:
                         doc_bytes = st.session_state.get('doc_split_bytes', b'')
                         bloques_act = st.session_state.get('bloques_detectados', [])
 
-                        zip_bytes = generar_zip_informes(
-                            doc_bytes, bloques_act, nombres_seleccionados,
-                            'docx', progreso_zip)
+                        # Bloqueo global: aunque .docx es rápido, se mantiene
+                        # la misma disciplina de turnos que en PDF para no
+                        # competir por CPU con otra conversión en curso.
+                        with _GLOBAL_HEAVY_LOCK:
+                            zip_bytes = generar_zip_informes(
+                                doc_bytes, bloques_act, nombres_seleccionados,
+                                'docx', progreso_zip)
 
                         progreso_zip.progress(1.0, text="✅ ZIP listo")
                         st.success(f"✅ ZIP generado con {n_sel} informes Word.")
@@ -1320,14 +1392,21 @@ with tab2:
                             "e instálalo, luego reinicia la app.  \n"
                             "También puedes usar el **ZIP Word** y convertir después.")
                     else:
-                        st.info("⏳ Convirtiendo a PDF con LibreOffice… esto puede tomar 1-2 minutos para 50 informes.")
+                        st.info("⏳ Convirtiendo a PDF con LibreOffice… esto puede tomar 1-2 minutos para 50 informes. "
+                                "Si otro usuario está convirtiendo al mismo tiempo, tu proceso esperará su turno "
+                                "automáticamente para no saturar el servidor.")
                         progreso_zip = st.progress(0, text="Preparando…")
                         doc_bytes = st.session_state.get('doc_split_bytes', b'')
                         bloques_act = st.session_state.get('bloques_detectados', [])
 
-                        zip_bytes = generar_zip_informes(
-                            doc_bytes, bloques_act, nombres_seleccionados,
-                            'pdf', progreso_zip)
+                        # Bloqueo global: esta es la operación más sensible a
+                        # concurrencia (LibreOffice headless). Serializa las
+                        # conversiones entre usuarios para evitar choques de
+                        # perfil y sobrecarga de CPU/RAM compartida.
+                        with _GLOBAL_HEAVY_LOCK:
+                            zip_bytes = generar_zip_informes(
+                                doc_bytes, bloques_act, nombres_seleccionados,
+                                'pdf', progreso_zip)
 
                         progreso_zip.progress(1.0, text="✅ ZIP listo")
                         st.success(f"✅ ZIP generado con {n_sel} informes PDF.")
@@ -1370,12 +1449,20 @@ with tab3:
     if archivos_pdf_tab3:
         st.markdown(f'<div class="chip-row"><span class="chip chip-green">✔ {len(archivos_pdf_tab3)} archivo(s)</span></div>',
                     unsafe_allow_html=True)
+        mostrar_advertencia_tamano(archivos_pdf_tab3)
     st.markdown('</div>', unsafe_allow_html=True)
 
     st.markdown('<div class="divider"></div>', unsafe_allow_html=True)
 
     if archivos_pdf_tab3:
-        btn_agrupar = st.button("🔍 Detectar y agrupar por cédula", key="btn_agrupar")
+        col_agr, col_limpiar3 = st.columns([3, 1])
+        with col_agr:
+            btn_agrupar = st.button("🔍 Detectar y agrupar por cédula", key="btn_agrupar")
+        with col_limpiar3:
+            if st.button("🧹 Liberar memoria", key="btn_limpiar_tab3",
+                         help="Borra de esta sesión los datos ya descargados para liberar RAM"):
+                st.session_state.pop('grupos_cedula', None)
+                st.success("Memoria de esta sesión liberada.")
 
         if btn_agrupar or st.session_state.get('grupos_cedula'):
             if btn_agrupar:
@@ -1434,7 +1521,11 @@ with tab3:
                     st.warning("No hay grupos con cédula detectada para fusionar.")
                 else:
                     progreso = st.progress(0, text="Preparando…")
-                    zip_bytes = generar_zip_fusionados(grupos_validos, progreso)
+                    # Bloqueo global: aunque pypdf es liviano, mantenemos la
+                    # misma disciplina de turnos frente a otras operaciones
+                    # pesadas para no sumar presión de CPU/RAM en paralelo.
+                    with _GLOBAL_HEAVY_LOCK:
+                        zip_bytes = generar_zip_fusionados(grupos_validos, progreso)
                     progreso.progress(1.0, text="✅ ZIP listo")
                     st.success(f"✅ ZIP generado con {len(grupos_validos)} PDF(s) fusionados.")
                     st.download_button(
